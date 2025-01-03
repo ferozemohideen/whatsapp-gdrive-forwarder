@@ -36,7 +36,14 @@ const localAuth = new LocalAuth({ clientId: 'session' });
 const client = new Client({
   authStrategy: localAuth,
   puppeteer: {
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: ['--no-sandbox', '--disable-setuid-sandbox',
+      "--no-first-run",
+      "--disable-dev-shm-usage",
+      "--disable-accelerated-2d-canvas",
+      "--disable-gpu",
+      "--single-process",
+      "--no-zygote",
+    ]
   }
 });
 
