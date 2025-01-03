@@ -7,123 +7,123 @@ const { google } = require('googleapis');
 
 const { SupabaseAuth } = require('./SupabaseAuth');
 
-// === 1) Load ENV Variables ===
 const {
   SUPABASE_URL,
   SUPABASE_KEY,
   SUPABASE_BUCKET,
-  DRIVE_FOLDER_ID,
   GOOGLE_CREDENTIALS,
+  DRIVE_FOLDER_ID,
   PORT = 3000,
 } = process.env;
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !SUPABASE_BUCKET) {
-  throw new Error('Missing Supabase config. Please set SUPABASE_URL, SUPABASE_KEY, SUPABASE_BUCKET.');
-}
-
-// For Google Drive
+// Parse Google creds if needed
 const googleCreds = GOOGLE_CREDENTIALS ? JSON.parse(GOOGLE_CREDENTIALS) : null;
-if (!googleCreds) {
-  throw new Error('Missing Google credentials in GOOGLE_CREDENTIALS env variable.');
-}
 
-if (!DRIVE_FOLDER_ID) {
-  throw new Error('Missing DRIVE_FOLDER_ID.');
-}
-
-// === 2) Create the Auth Strategies ===
-// "LocalAuth" will handle normal local session logic in ./.wwebjs_auth/session
-// "SupabaseAuth" will sync that session folder with Supabase
+// 1) Create a custom SupabaseAuth (NO watchers)
 const supabaseAuth = new SupabaseAuth({
   supabaseUrl: SUPABASE_URL,
   supabaseKey: SUPABASE_KEY,
   bucketName: SUPABASE_BUCKET,
   remoteDataPath: 'whatsapp/sessions',
-  sessionName: 'session',  // the same directory name used by LocalAuth
-  debug: true,
+  sessionName: 'session',   // must match LocalAuth's clientId
+  debug: true
 });
 
-// We also rely on LocalAuth so that whatsapp-web.js properly loads/writes session data
-const localAuth = new LocalAuth({
-  clientId: 'session', // this means ./.wwebjs_auth/session
-});
+// 2) Create LocalAuth
+const localAuth = new LocalAuth({ clientId: 'session' });
 
-// === 3) Create the WhatsApp client ===
+// 3) Create the WhatsApp client (we only pass LocalAuth to the constructor)
 const client = new Client({
-  // We'll primarily rely on LocalAuth. 
-  // But we also pass "supabaseAuth" so it can do `beforeBrowserInitialized` / `afterBrowserInitialized`.
-  authStrategy: localAuth, // The library will only accept one "authStrategy" 
-                           // so we do a small trick below:
-  puppeteer: { 
+  authStrategy: localAuth,
+  puppeteer: {
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   }
 });
 
-// Manually hook SupabaseAuth's lifecycle
-client.on('launch_browser', async () => {
-  // "launch_browser" isn't an official event, 
-  // but let's pretend we call supabaseAuth's methods here:
+// We'll manually call supabaseAuth.* around client.initialize()
 
-  // If your version of whatsapp-web.js doesn't have 'launch_browser', 
-  // call supabaseAuth.beforeBrowserInitialized() just before client.initialize():
-  await supabaseAuth.beforeBrowserInitialized();
-});
-
-client.on('ready', async () => {
-  // after the browser is up, call afterBrowserInitialized
-  await supabaseAuth.afterBrowserInitialized();
-  console.log('WhatsApp is ready!');
-});
-
-// Standard events
+// --- Standard wwebjs events ---
 client.on('qr', (qr) => {
-  console.log('QR code received, scan it with your phone:');
+  console.log('QR code received. Scan it with WhatsApp:');
   qrcode.generate(qr, { small: true });
 });
+
 client.on('authenticated', () => {
   console.log('WhatsApp client authenticated!');
 });
-client.on('auth_failure', msg => {
-  console.error('Authentication failure:', msg);
+
+client.on('auth_failure', (msg) => {
+  console.error('AUTH FAILURE', msg);
 });
 
-// === 4) Listening for Media + Upload to Google Drive ===
+client.on('ready', async () => {
+  console.log('WhatsApp client is ready!');
+  // Let SupabaseAuth do after-browser logic (which might do a forced upload)
+  await supabaseAuth.afterBrowserInitialized();
+});
+
+// Listen for media messages, for example
 client.on('message', async (msg) => {
   if (msg.hasMedia) {
+    console.log('Incoming media from', msg.from);
     try {
       const media = await msg.downloadMedia();
-      // Upload to Google Drive
-      const driveFileId = await uploadToDrive(media);
-      console.log('Media uploaded to Drive. File ID:', driveFileId);
+      await uploadToDrive(media);
+      console.log('Uploaded to Drive!');
     } catch (err) {
-      console.error('Error uploading media to Drive:', err);
+      console.error('Error uploading media:', err);
     }
   }
 });
 
+// 4) Startup flow
+(async () => {
+  // Attempt to restore session from Supabase
+  await supabaseAuth.beforeBrowserInitialized();
+  // Now initialize the client
+  client.initialize();
+})();
+
+// Simple Express server
+const app = express();
+app.get('/', (req, res) => {
+  res.send('WhatsApp -> SupabaseAuth -> GDrive (No watchers) is running!');
+});
+
+// If you want a route that triggers a manual upload:
+app.get('/backup-session', async (req, res) => {
+  try {
+    await supabaseAuth.uploadSessionZip();
+    res.send('Session manually uploaded to Supabase!');
+  } catch (err) {
+    res.status(500).send('Error uploading session: ' + err.message);
+  }
+});
+
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
+
+// Helper function to upload media to Google Drive
 async function uploadToDrive(media) {
-  // 1. Auth with Google
+  if (!googleCreds) return;
+
   const auth = new google.auth.GoogleAuth({
     credentials: googleCreds,
     scopes: ['https://www.googleapis.com/auth/drive.file']
   });
   const driveService = google.drive({ version: 'v3', auth });
 
-  // 2. Build filename & convert base64 to buffer
-  const ext = media.mimetype.split('/')[1]; // e.g. 'jpeg', 'png', 'mp4'
+  const ext = media.mimetype.split('/')[1];
   const fileName = `whatsapp-media-${Date.now()}.${ext}`;
   const fileBuffer = Buffer.from(media.data, 'base64');
 
-  // 3. Make a stream
   const { PassThrough } = require('stream');
   const bufferStream = new PassThrough();
   bufferStream.end(fileBuffer);
 
-  // 4. Upload
   const resp = await driveService.files.create({
     requestBody: {
       name: fileName,
-      parents: [DRIVE_FOLDER_ID],
+      parents: [DRIVE_FOLDER_ID]
     },
     media: {
       mimeType: media.mimetype,
@@ -133,17 +133,3 @@ async function uploadToDrive(media) {
   });
   return resp.data.id;
 }
-
-// === 5) Start the client + Express server ===
-(async () => {
-  // If you don't have a "launch_browser" event, call supabaseAuth.beforeBrowserInitialized() here:
-  await supabaseAuth.beforeBrowserInitialized();
-  // Then initialize the client
-  client.initialize();
-})();
-
-const app = express();
-app.get('/', (req, res) => {
-  res.send('WhatsApp -> SupabaseAuth -> Google Drive is running!');
-});
-app.listen(PORT, () => console.log(`Server is listening on port ${PORT}`));

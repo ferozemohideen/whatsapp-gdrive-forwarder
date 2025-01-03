@@ -2,19 +2,19 @@
 const { AuthStrategy, NoAuth } = require('whatsapp-web.js');
 const path = require('path');
 const fs = require('fs');
-const chokidar = require('chokidar');
 const AdmZip = require('adm-zip');
 const { createClient } = require('@supabase/supabase-js');
 
 /**
- * SupabaseAuth: merges LocalAuth folder usage with a Supabase Storage backup of the session.
+ * SupabaseAuth: merges LocalAuth folder usage with a Supabase-based backup
+ * of the `.wwebjs_auth/<sessionName>` directory, but WITHOUT file-watching.
  */
 class SupabaseAuth extends NoAuth {
   /**
    * @param {object} options
-   * @param {string} options.supabaseUrl
-   * @param {string} options.supabaseKey
-   * @param {string} options.bucketName
+   * @param {string} options.supabaseUrl       - Your Supabase project URL (https://xyzcompany.supabase.co).
+   * @param {string} options.supabaseKey       - Your Supabase service (or anon) key. For private buckets, typically service key is needed.
+   * @param {string} options.bucketName        - The bucket to store the zip in.
    * @param {string} [options.remoteDataPath='whatsapp/sessions']
    * @param {string} [options.sessionName='session']
    * @param {boolean} [options.debug=false]
@@ -28,7 +28,7 @@ class SupabaseAuth extends NoAuth {
     debug = false
   }) {
     super();
-    if (!supabaseUrl || !supabaseKey) throw new Error('Supabase URL/Key required.');
+    if (!supabaseUrl || !supabaseKey) throw new Error('Supabase URL & Key are required.');
     if (!bucketName) throw new Error('Supabase bucketName is required.');
 
     this.supabaseUrl = supabaseUrl;
@@ -40,7 +40,7 @@ class SupabaseAuth extends NoAuth {
 
     this.authDir = path.join(process.cwd(), '.wwebjs_auth', this.sessionName);
 
-    // Create Supabase client
+    // Create the Supabase client
     this.supabase = createClient(this.supabaseUrl, this.supabaseKey);
   }
 
@@ -51,7 +51,8 @@ class SupabaseAuth extends NoAuth {
   }
 
   /**
-   * Called before launching Chromium. We attempt to download and unzip any existing session ZIP.
+   * Called before the browser is launched. We'll attempt to load an existing
+   * session from Supabase by downloading & unzipping.
    */
   async beforeBrowserInitialized() {
     this.debugLog('beforeBrowserInitialized: Checking for existing session in Supabase...');
@@ -60,7 +61,7 @@ class SupabaseAuth extends NoAuth {
     const zipPath = path.join(process.cwd(), `${this.sessionName}.zip`);
     const remoteFilePath = path.join(this.remoteDataPath, `${this.sessionName}.zip`).replace(/\\/g, '/');
 
-    // List the remote directory
+    // 1. List the remote directory
     const { data: fileList, error: listErr } = await this.supabase
       .storage
       .from(this.bucketName)
@@ -68,17 +69,17 @@ class SupabaseAuth extends NoAuth {
 
     if (listErr) {
       this.debugLog(`Error listing remote dir: ${listErr.message}`);
-      return;
+      return; // No session to restore
     }
 
-    // Check if there's a .zip with our sessionName
+    // 2. Check if there's a .zip named <sessionName>.zip
     const foundZip = fileList && fileList.find(item => item.name === `${this.sessionName}.zip`);
     if (!foundZip) {
       this.debugLog('No existing zip found in Supabase Storage. Starting fresh.');
       return;
     }
 
-    // Download the ZIP
+    // 3. Download the ZIP
     const { data: downloadData, error: downloadErr } = await this.supabase
       .storage
       .from(this.bucketName)
@@ -89,57 +90,41 @@ class SupabaseAuth extends NoAuth {
       return;
     }
 
-    // Save the file to disk
+    // 4. Write the blob to disk
     const arrayBuffer = await downloadData.arrayBuffer();
     fs.writeFileSync(zipPath, Buffer.from(arrayBuffer));
-    // Unzip
+
+    // 5. Unzip into ./.wwebjs_auth/<sessionName>
     const zip = new AdmZip(zipPath);
     zip.extractAllTo(this.authDir, true);
-    this.debugLog(`Session restored from Supabase: ${remoteFilePath} → ${this.authDir}`);
+
+    this.debugLog(`Session restored from Supabase: ${remoteFilePath} -> ${this.authDir}`);
   }
 
   /**
-   * Called after the browser is up. We'll watch the authDir for changes,
-   * and forcibly upload once to confirm we push the session if it exists.
+   * Called after the browser is initialized. We won't watch for changes automatically.
+   * If you want at least one upload on startup, call uploadSessionZip() here.
    */
   async afterBrowserInitialized() {
-    this.debugLog(`afterBrowserInitialized: Setting up watchers in ${this.authDir}`);
+    this.debugLog('afterBrowserInitialized: Doing one optional forced upload (comment out if unwanted)...');
 
-    // Force at least one upload on startup (in case no file changes occur)
-    try {
-      await this.uploadSessionZip();
-    } catch (err) {
-      console.error('Error uploading session zip on startup:', err);
-    }
-
-    // Watch for changes
-    const watcher = chokidar.watch(this.authDir, {
-      ignoreInitial: true,
-      persistent: true
-    });
-
-    watcher.on('all', async (event, filePath) => {
-      this.debugLog(`File event: ${event} in ${filePath}. Uploading zip...`);
-      try {
-        await this.uploadSessionZip();
-      } catch (err) {
-        console.error('Error uploading session zip:', err);
-      }
-    });
+    // If you definitely want to push up the local session right away:
+    await this.uploadSessionZip();
   }
 
   /**
-   * Zip the .wwebjs_auth folder and upload to Supabase. 
-   * Using Buffer read to avoid the "duplex" error with Node 18 fetch.
+   * Method to manually zip ./.wwebjs_auth/<sessionName> and upload to Supabase.
+   * You can call this from anywhere in your code if you want to do an upload.
    */
   async uploadSessionZip() {
     const zipPath = path.join(process.cwd(), `${this.sessionName}.zip`);
+
     // Zip the entire authDir
     const zip = new AdmZip();
     zip.addLocalFolder(this.authDir);
     zip.writeZip(zipPath);
 
-    // Instead of streaming, read the file as a buffer
+    // Read it into a buffer (avoids the "duplex" error)
     const zipBuffer = fs.readFileSync(zipPath);
 
     const remoteFilePath = path.join(this.remoteDataPath, `${this.sessionName}.zip`).replace(/\\/g, '/');
@@ -160,6 +145,7 @@ class SupabaseAuth extends NoAuth {
     this.debugLog(`Session zip uploaded to Supabase at: ${remoteFilePath}`);
   }
 
+  // The following override methods are no-ops for completeness:
   async onAuthenticationNeeded() {
     this.debugLog('onAuthenticationNeeded()');
   }
