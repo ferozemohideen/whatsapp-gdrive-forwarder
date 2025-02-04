@@ -13,6 +13,7 @@ const {
   SUPABASE_BUCKET,
   GOOGLE_CREDENTIALS,
   DRIVE_FOLDER_ID,
+  TARGET_CHAT_ID,
   PORT = 3000,
 } = process.env;
 
@@ -71,8 +72,14 @@ client.on('ready', async () => {
 
 // Listen for media messages, for example
 client.on('message', async (msg) => {
+  // Only process messages from the target chat
+  console.log('Incoming message from:', msg.from);
+  if (msg.from !== TARGET_CHAT_ID) {
+    return;
+  }
+
   if (msg.hasMedia) {
-    console.log('Incoming media from', msg.from);
+    console.log('Incoming media from target chat:', msg.from);
     try {
       const media = await msg.downloadMedia();
       await uploadToDrive(media);
